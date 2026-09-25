@@ -1,0 +1,3 @@
+# Settings changed through /potionlimiter are stored here.
+# Any missing option defaults to enabled.
+limits: {}

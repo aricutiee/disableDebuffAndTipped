@@ -1,0 +1,17 @@
+name: disableDebuffAndTipped
+version: '${version}'
+
+main: me.jade.disableDebuffAndTipped.DisableDebuffAndTipped
+api-version: '1.21.11'
+load: POSTWORLD
+
+commands:
+  potionlimiter:
+    description: Configure allowed potion forms and upgrades
+    usage: /potionlimiter
+    permission: potionlimiter.admin
+
+permissions:
+  potionlimiter.admin:
+    description: Allows use of the potion limiter GUI
+    default: op

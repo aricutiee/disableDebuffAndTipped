@@ -7,6 +7,7 @@ import org.bukkit.entity.*;
 import org.bukkit.event.*;
 import org.bukkit.event.entity.*;
 import org.bukkit.event.inventory.*;
+import org.bukkit.event.player.PlayerItemConsumeEvent;
 import org.bukkit.inventory.*;
 import org.bukkit.inventory.meta.*;
 import org.bukkit.persistence.PersistentDataType;
@@ -15,15 +16,16 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 import java.util.*;
 
-public final class DisableDebuffAndTipped extends JavaPlugin implements Listener {
+public class DisableDebuffAndTipped extends JavaPlugin implements Listener {
     private static final Set<Material> POTION_ITEMS = EnumSet.of(Material.POTION, Material.SPLASH_POTION, Material.LINGERING_POTION);
+    static final int WEAVING_TICKS = 8 * 60 * 20;
     private NamespacedKey actionKey;
 
     @Override public void onEnable() {
         saveDefaultConfig();
         actionKey = new NamespacedKey(this, "menu_action");
         getServer().getPluginManager().registerEvents(this, this);
-        getServer().getScheduler().runTaskTimer(this, this::cleanPlayerInventories, 0L, 1L);
+        getServer().getScheduler().runTaskTimer(this, this::cleanPlayerInventories, 0L, 5L);
     }
 
     @Override public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
@@ -44,19 +46,49 @@ public final class DisableDebuffAndTipped extends JavaPlugin implements Listener
         for (int slot = 0; slot < contents.length; slot++) {
             ItemStack item = contents[slot];
             if (item == null || item.getType().isAir()) continue;
-            if (item.getType() == Material.TIPPED_ARROW || item.getType() == Material.SPECTRAL_ARROW) {
-                inventory.setItem(slot, new ItemStack(Material.ARROW, item.getAmount()));
-            } else if (isDebuffPotion(item)) inventory.setItem(slot, createWaterPotion(item));
-            else {
-                ItemStack limited = applyLimits(item);
-                if (limited != item) inventory.setItem(slot, limited);
-            }
+            ItemStack result = normalize(item);
+            if (result != item) inventory.setItem(slot, result);
         }
+    }
+
+    /** Existing restrictions, with explicit exceptions and an eight-minute Weaving override. */
+    ItemStack normalize(ItemStack item) {
+        if (item == null || item.getType().isAir()) return item;
+        if (item.getType() == Material.TIPPED_ARROW || item.getType() == Material.SPECTRAL_ARROW)
+            return new ItemStack(Material.ARROW, item.getAmount());
+        if (isDebuffPotion(item)) return createWaterPotion(item);
+        ItemStack result = applyLimits(item);
+        if (!(result.getItemMeta() instanceof PotionMeta meta) || !POTION_ITEMS.contains(result.getType())) return result;
+        PotionEffect weaving = meta.getCustomEffects().stream()
+                .filter(e -> e.getType().equals(PotionEffectType.WEAVING)).findFirst().orElse(null);
+        if (meta.getBasePotionType() != PotionType.WEAVING && weaving == null) return result;
+        if (weaving != null && weaving.getDuration() == WEAVING_TICKS) return result;
+        result = result.clone();
+        meta.addCustomEffect(new PotionEffect(PotionEffectType.WEAVING, WEAVING_TICKS,
+                weaving == null ? 0 : weaving.getAmplifier(), weaving != null && weaving.isAmbient(),
+                weaving == null || weaving.hasParticles(), weaving == null || weaving.hasIcon()), true);
+        result.setItemMeta(meta);
+        return result;
+    }
+
+    private boolean protectedFamily(PotionMeta meta) {
+        PotionType base = meta.getBasePotionType();
+        return base == PotionType.WEAVING || base != null && familyOf(base).equals("turtle_master");
+    }
+
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onConsume(PlayerItemConsumeEvent event) { event.setItem(normalize(event.getItem())); }
+
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onBrew(BrewEvent event) {
+        List<ItemStack> results = event.getResults();
+        for (int i = 0; i < results.size(); i++) results.set(i, normalize(results.get(i)));
     }
 
     private ItemStack applyLimits(ItemStack original) {
         if (!POTION_ITEMS.contains(original.getType()) || !(original.getItemMeta() instanceof PotionMeta meta)) return original;
         PotionType type = meta.getBasePotionType();
+        if (protectedFamily(meta)) return original;
         if (type == null || variantOf(type) == Variant.NORMAL) return original;
         String family = familyOf(type);
         if (isAllowed(formOf(original.getType()), family, variantOf(type))) return original;
@@ -89,12 +121,21 @@ public final class DisableDebuffAndTipped extends JavaPlugin implements Listener
 
     @EventHandler(ignoreCancelled = true) public void onItemSpawn(ItemSpawnEvent event) {
         ItemStack item = event.getEntity().getItemStack();
-        if (POTION_ITEMS.contains(item.getType()) && isNearTrialSpawner(event.getEntity()))
-            event.getEntity().setItemStack(makeTrialPotionLong(item));
+        if (trialCandidate(item) && isNearTrialSpawner(event.getEntity())) item = makeTrialPotionLong(item);
+        event.getEntity().setItemStack(normalize(item));
     }
 
     @EventHandler(ignoreCancelled = true) public void onProjectileLaunch(ProjectileLaunchEvent event) {
-        if (event.getEntity() instanceof ThrownPotion potion && isNearTrialSpawner(potion)) potion.setItem(makeTrialPotionLong(potion.getItem()));
+        if (event.getEntity() instanceof ThrownPotion potion) {
+            ItemStack item = potion.getItem();
+            if (trialCandidate(item) && isNearTrialSpawner(potion)) item = makeTrialPotionLong(item);
+            potion.setItem(normalize(item));
+        }
+    }
+
+    private boolean trialCandidate(ItemStack item) {
+        if (!(item.getItemMeta() instanceof PotionMeta meta)) return false;
+        return meta.getBasePotionType() == PotionType.STRENGTH || meta.getBasePotionType() == PotionType.SWIFTNESS;
     }
 
     private boolean isNearTrialSpawner(Entity entity) {
@@ -226,7 +267,7 @@ public final class DisableDebuffAndTipped extends JavaPlugin implements Listener
         for (PotionType type : PotionType.values()) {
             String family = familyOf(type);
             if (variantOf(type) == Variant.NORMAL && (findPotionType("long_" + family) != null || findPotionType("strong_" + family) != null)
-                    && !result.contains(family)) result.add(family);
+                    && !family.equals("turtle_master") && !family.equals("weaving") && !result.contains(family)) result.add(family);
         }
         result.sort(Comparator.comparing(this::pretty));
         return result;
@@ -255,10 +296,13 @@ public final class DisableDebuffAndTipped extends JavaPlugin implements Listener
     private boolean isDebuffPotion(ItemStack item) {
         if (!POTION_ITEMS.contains(item.getType()) || !(item.getItemMeta() instanceof PotionMeta meta)) return false;
         PotionType base = meta.getBasePotionType();
-        if (base == PotionType.WEAVING || (base != null && familyOf(base).equals("turtle_master"))) return false;
-        return (base != null && base.getPotionEffects().stream().anyMatch(e -> e.getType().getCategory() == PotionEffectTypeCategory.HARMFUL))
-                || meta.getCustomEffects().stream().anyMatch(e -> e.getType().getCategory() == PotionEffectTypeCategory.HARMFUL);
+        if (protectedFamily(meta)) return false;
+        return (base != null && base.getPotionEffects().stream().anyMatch(e -> harmful(e.getType())))
+                || meta.getCustomEffects().stream().anyMatch(e -> !e.getType().equals(PotionEffectType.WEAVING)
+                        && harmful(e.getType()));
     }
+
+    public boolean harmful(PotionEffectType type) { return type.getCategory() == PotionEffectTypeCategory.HARMFUL; }
 
     private ItemStack createWaterPotion(ItemStack original) {
         ItemStack water = new ItemStack(original.getType(), original.getAmount());
